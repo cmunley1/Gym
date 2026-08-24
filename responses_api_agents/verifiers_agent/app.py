@@ -35,6 +35,12 @@ from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.responses_converter import ResponsesConverter
 
 
+try:
+    from . import nemogym_client
+except ImportError:  # The component server loads app.py as a top-level module.
+    import nemogym_client
+
+
 class VerifiersAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     verifiers: Annotated[vf.EnvConfig, BeforeValidator(vf.resolve_env_config)]
@@ -70,6 +76,9 @@ class VerifiersAgent(SimpleResponsesAPIAgent):
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
+        # Route v1 through a client that keeps the token ids Gym's model server returns;
+        # the stock EvalClient discards them, leaving rollouts untrainable.
+        nemogym_client.install()
         self._env = vf.load_environment(self.config.verifiers)
         self._tasks = []
         self._task_iter = iter(self._env.taskset)
@@ -136,6 +145,7 @@ class VerifiersAgent(SimpleResponsesAPIAgent):
         trace = episode.traces[0]
         branch = trace.branches[-1]
         calls = iter(branch.calls)
+        seen_token_ids: list[int] = []
         input_items, output = [], []
         items = input_items
         for node in branch.nodes:
@@ -149,6 +159,19 @@ class VerifiersAgent(SimpleResponsesAPIAgent):
             wire = message_to_wire(message)
             if isinstance(message, vf.AssistantMessage) and message.reasoning_content:
                 wire["content"] = f"<think>{message.reasoning_content}</think>{message.content or ''}"
+            # message_to_wire is a whitelist, so training tokens have to be re-attached
+            # here or ResponsesConverter(return_token_id_information=True) sees nothing.
+            # A node holds its own segment only, so concatenating nodes reproduces the
+            # branch sequence exactly (no restated prefix).
+            if node.token_ids:
+                lead = [tid for tid, sampled in zip(node.token_ids, node.mask) if not sampled]
+                gen = [tid for tid, sampled in zip(node.token_ids, node.mask) if sampled]
+                # NeMo-RL asserts the running sequence is a prefix of each assistant
+                # message's prompt_token_ids, so these are cumulative, not per-node slices.
+                wire["prompt_token_ids"] = seen_token_ids + lead
+                wire["generation_token_ids"] = gen
+                wire["generation_log_probs"] = list(node.logprobs)
+                seen_token_ids = seen_token_ids + lead + gen
             items.extend(self._converter.chat_completions_messages_to_responses_items([wire]))
 
         tools = [
